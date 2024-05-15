@@ -1,0 +1,56 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Event Service Templates
+
+Configuration:
+  Capabilities: CAPABILITY_IAM,CAPABILITY_AUTO_EXPAND
+
+Parameters:
+  Stage:
+    Type: String
+    AllowedValues:
+      - prod
+      - local
+      - dev
+    Default: local
+    Description: Stage of development. Appends prefixes to queue names.
+
+Resources:
+  EventLogLambdaFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./build/libs/event-service-java.jar
+      Handler: ai.utiliti.bes.lambda.EventLogLambdaFunction::handleRequest
+      Runtime: java11
+      Events:
+        EventLogEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt EventLogSqsQueue.Arn
+            BatchSize: 1
+  EventLogSqsQueue:
+    Type: AWS::SQS::Queue
+  PolygonBlockQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Stage}-polygon-blocks.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+  EthereumBlockQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      QueueName: !Sub ${Stage}-ethereum-blocks.fifo
+      FifoQueue: true
+      ContentBasedDeduplication: true
+  GoerliBlockQueue:
+      Type: AWS::SQS::Queue
+      Properties:
+        QueueName: !Sub ${Stage}-goerli-blocks.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+  MumbaiBlockQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+        QueueName: !Sub ${Stage}-mumbai-blocks.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true

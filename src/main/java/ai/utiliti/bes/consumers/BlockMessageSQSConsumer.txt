@@ -1,0 +1,325 @@
+package ai.utiliti.bes.consumers;
+
+import ai.utiliti.bes.BlockStatus;
+import ai.utiliti.bes.model.BlockchainEvent;
+import ai.utiliti.bes.model.EventJob;
+import ai.utiliti.bes.model.WrappedBlockHeader;
+import ai.utiliti.bes.respository.BlockchainEventRepository;
+import ai.utiliti.bes.respository.WrappedBlockRepository;
+import ai.utiliti.bes.services.SQSService;
+import ai.utiliti.bes.tasks.EventLogSqsTask;
+import ai.utiliti.bes.tasks.LoadBlocksTask;
+import ai.utiliti.bes.util.EventDetail;
+import ai.utiliti.bes.util.InternalApiUtil;
+import ai.utiliti.bes.util.LogParser;
+import ai.utiliti.bes.webhooks.ContractEvent;
+import ai.utiliti.bes.webhooks.WebhookContractSubscription;
+import com.google.gson.Gson;
+import org.hibernate.exception.ConstraintViolationException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.cloud.aws.messaging.config.annotation.EnableSqs;
+import org.springframework.cloud.aws.messaging.listener.SqsMessageDeletionPolicy;
+import org.springframework.cloud.aws.messaging.listener.Visibility;
+import org.springframework.cloud.aws.messaging.listener.annotation.SqsListener;
+import org.springframework.context.annotation.Profile;
+import org.springframework.dao.DataIntegrityViolationException;
+import org.springframework.data.util.Pair;
+import org.springframework.stereotype.Component;
+import org.web3j.crypto.Keys;
+import org.web3j.protocol.Web3j;
+import org.web3j.protocol.core.DefaultBlockParameter;
+import org.web3j.protocol.core.methods.request.EthFilter;
+import org.web3j.protocol.core.methods.response.EthBlock;
+import org.web3j.protocol.core.methods.response.EthLog;
+import java.math.BigInteger;
+import java.time.Instant;
+import java.util.*;
+import java.util.concurrent.ExecutorService;
+import java.util.concurrent.Executors;
+import java.util.concurrent.Future;
+import java.util.concurrent.TimeUnit;
+import java.util.stream.Collectors;
+
+@Component
+@EnableSqs
+@Profile("network-data")
+public class BlockMessageSQSConsumer {
+
+    private final Logger logger = LoggerFactory.getLogger(BlockMessageSQSConsumer.class);
+    private boolean resyncRunning = false;
+
+    private final int maxResyncBlockChunk = 5000;
+
+    @Autowired
+    private Web3j web3j;
+
+    @Autowired
+    private BlockchainEventRepository blockchainEventRepository;
+
+    @Autowired
+    private WrappedBlockRepository wrappedBlockRepository;
+
+    @Autowired
+    private SQSService sqsService;
+
+    @Autowired
+    private Gson gson;
+
+    private final ExecutorService executor = Executors.newFixedThreadPool(Integer.parseInt(System.getenv("MAX_RESYNC_WORKER_COUNT")));
+
+    @Autowired
+    private ConsumerVisibilityExtender visibilityExtender;
+
+    @SqsListener(value = "${bes.block.queue.url}", deletionPolicy = SqsMessageDeletionPolicy.NO_REDRIVE)
+    public void handle(String serializedMessage, Visibility visibility) {
+        try {
+
+            visibilityExtender.start(visibility, 20, TimeUnit.SECONDS);
+
+            WrappedBlockHeader wrappedBlockHeader = gson.fromJson(serializedMessage, WrappedBlockHeader.class);
+
+            logger.info("Recieved block {}", wrappedBlockHeader.getNumber().intValue());
+
+            Optional<WrappedBlockHeader> lastProcessedBlock = wrappedBlockRepository.findFirstByNetworkOrderByNumberDesc(Integer.parseInt(System.getenv("NETWORK_ID")));
+
+            List<EventJob> outOfSyncJobs = getOutOfSyncJobs(wrappedBlockHeader, lastProcessedBlock.orElse(null));
+            if (outOfSyncJobs.size() > 0) {
+
+                logger.info("Found {} out of sync jobs. Sending to SQS to be emitted to webhooks", outOfSyncJobs.size());
+
+                batchAndSendEventJobs(outOfSyncJobs);
+
+                logger.info("Sent {} jobs to SQS", outOfSyncJobs.size());
+                return;
+            }
+
+            List<EventJob> jobs = getEventJobsFromBlock(wrappedBlockHeader);
+
+            if (jobs == null) {
+                logger.error("Jobs for block returned null");
+                return;
+            }
+
+            if (jobs.size() > 0) {
+                logger.info(wrappedBlockHeader.getNumber().intValue() + " has " + jobs.size() + " events to be emitted!");
+
+                batchAndSendEventJobs(jobs);
+            } else {
+                logger.info(wrappedBlockHeader.getNumber().intValue() + " has no events.");
+            }
+
+            //this.checkEventFinality(wrappedBlockHeader);
+        } catch (Exception e) {
+            logger.error("Error encountered while processing block", e);
+        } finally {
+            visibilityExtender.stop();
+        }
+    }
+
+    private void batchAndSendEventJobs(List<EventJob> jobs) throws InterruptedException {
+
+        List<Pair<Integer, Integer>> eventLogBatchIndecies = createTaskBatches(0, jobs.size(), Integer.parseInt(System.getenv("MAX_RESYNC_WORKER_COUNT")));
+
+        List<EventLogSqsTask> eventLogJobFutures = new ArrayList<>();
+
+        for (Pair<Integer, Integer> batch : eventLogBatchIndecies) {
+            List<EventJob> jobsForTask = jobs.subList(batch.getFirst(), batch.getSecond() + 1);
+            eventLogJobFutures.add(new EventLogSqsTask(eventLogBatchIndecies.indexOf(batch), jobsForTask, this.sqsService));
+        }
+        executor.invokeAll(eventLogJobFutures);
+    }
+
+    private List<EventJob> getOutOfSyncJobs(WrappedBlockHeader recievedBlock, WrappedBlockHeader lastProcessedBlock) {
+        if (lastProcessedBlock != null && recievedBlock.getNumber().intValue() > lastProcessedBlock.getNumber().add(BigInteger.ONE).intValue()) {
+            logger.info("Out of sync, last block was {} but got {}",
+                        lastProcessedBlock.getNumber().intValue(),
+                        recievedBlock.getNumber().intValue());
+
+            int blocksMissing = recievedBlock.getNumber().subtract(lastProcessedBlock.getNumber()).intValue();
+
+            if (blocksMissing > maxResyncBlockChunk) {
+                blocksMissing = maxResyncBlockChunk;
+            }
+
+            if (this.resyncRunning) {
+                logger.info("Resync is already running!");
+                return new ArrayList<>();
+            }
+            return startResyncJob(lastProcessedBlock.getNumber().intValue(), blocksMissing);
+        }
+        return new ArrayList<>();
+    }
+
+    private List<Pair<Integer, Integer>> createTaskBatches(int start, int amount, int workers) {
+        int batchSize = (int) Math.floor(amount / workers);
+        int remainder = amount % workers;
+
+        List<Pair<Integer, Integer>> pairs = new ArrayList<>();
+        for (int i = 0; i < workers; i++) {
+            int startNum = start + i * batchSize;
+            int endNum = startNum + batchSize - 1;
+            if (i == workers - 1) {
+                endNum += remainder;
+            }
+            pairs.add(Pair.of(startNum, endNum));
+        }
+        return pairs;
+    }
+    private List<EventJob> startResyncJob(int lastProcessedBlockNumber, int blocksMissing) {
+        logger.info("Starting resync task!");
+        this.resyncRunning = true;
+        int maxResyncWorkerCount = Integer.parseInt(System.getenv("MAX_RESYNC_WORKER_COUNT"));
+
+        List<EventJob> outOfSyncJobs = new ArrayList<>();
+
+        int workers = Math.min(maxResyncWorkerCount, blocksMissing);
+
+        logger.info("Creating {} workers", workers);
+        try {
+
+            List<Pair<Integer, Integer>> batches = createTaskBatches(lastProcessedBlockNumber, blocksMissing, workers);
+
+            Comparator<EthBlock> blockComparator = Comparator.comparing(o -> o.getBlock().getNumber());
+            Set<EthBlock> sortedBlocks = new TreeSet<>(blockComparator);
+
+            List<LoadBlocksTask> tasks = new ArrayList<>();
+
+            for (Pair<Integer, Integer> batch : batches) {
+                tasks.add(new LoadBlocksTask(batches.indexOf(batch), batch.getFirst(), batch.getSecond(), this.web3j));
+            }
+
+            List<Future<List<EthBlock>>> taskFutures = executor.invokeAll(tasks); // This will be blocking till all tasks complete
+            logger.info("Re-sync - Loaded all blocks! Beginning sort");
+
+            for (Future<List<EthBlock>> future : taskFutures) {
+                List<EthBlock> blocks = future.get();
+                sortedBlocks.addAll(blocks);
+            }
+
+            logger.info("Re-sync - Sorted all blocks! Beginning log parsing");
+            double i = 0;
+            // We might be able to avoid this
+            for (EthBlock block : sortedBlocks) {
+                i++;
+                WrappedBlockHeader wrappedBlockHeader = new WrappedBlockHeader(block.getBlock());
+                List<EventJob> jobs = getEventJobsFromBlock(wrappedBlockHeader);
+
+                double percent = i / sortedBlocks.size() * 100;
+
+                logger.info("Re-sync - Processing blocks {}% ({} blocks remain)", String.format("%.2f", percent), sortedBlocks.size() - i);
+
+                if (jobs == null || jobs.size() == 0) continue;
+
+                outOfSyncJobs.addAll(jobs);
+            }
+
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        logger.info("Re-sync complete, {} jobs being returned.", outOfSyncJobs.size());
+
+        this.resyncRunning = false;
+        return outOfSyncJobs;
+    }
+
+    private List<EventJob> getEventJobsFromBlock(WrappedBlockHeader blockHeader) {
+        logger.info("Loading event jobs from block {}", blockHeader.getNumber());
+        try {
+            List<EventJob> eventJobs = new ArrayList<>();
+            List<WebhookContractSubscription> subscriptions = InternalApiUtil.getWebhookSubscriptions();
+
+            if (subscriptions.size() <= 0) {
+                saveBlockHeader(blockHeader);
+                return eventJobs;
+            }
+
+            Map<String, List<WebhookContractSubscription>> contractAddressIndexedMap = new HashMap<>();
+
+            for (WebhookContractSubscription subscription : subscriptions) {
+                String checksumAddress = Keys.toChecksumAddress(subscription.getContractAddress());
+
+                List<WebhookContractSubscription> subscrips = contractAddressIndexedMap.getOrDefault(checksumAddress, new ArrayList<>());
+                subscrips.add(subscription);
+
+                contractAddressIndexedMap.put(checksumAddress, subscrips);
+            }
+
+            EthLog ethLogs = web3j.ethGetLogs(new EthFilter(DefaultBlockParameter.valueOf(blockHeader.getNumber()), DefaultBlockParameter.valueOf(blockHeader.getNumber()), subscriptions.stream().map(WebhookContractSubscription::getContractAddress).collect(Collectors.toList()))).send();
+
+            if (ethLogs.getLogs().size() <= 0) {
+                saveBlockHeader(blockHeader);
+                return eventJobs;
+            }
+
+            for (EthLog.LogResult<EthLog.LogObject> log : ethLogs.getLogs()) {
+                EthLog.LogObject object = log.get();
+                String checksumAddress = Keys.toChecksumAddress(object.getAddress());
+
+                List<WebhookContractSubscription> webhooks = contractAddressIndexedMap.get(checksumAddress);
+                if (webhooks == null || webhooks.size() <= 0) {
+                    continue;
+                }
+
+                for (WebhookContractSubscription subscription : webhooks) {
+                    EventDetail details = LogParser.decodeLogToEventDetails(web3j, subscription.getAbi(), log.get());
+
+                    if (details == null) continue;
+
+                    if (!details.getEventName().equals(subscription.getEventName())) {
+                        continue;
+                    }
+
+                    /*
+                        Maybe creating the blockchain event should only happen once this is queued.
+                     */
+
+                    BlockchainEvent blockchainEvent = new BlockchainEvent(
+                            details.getEventName(),
+                            Date.from(Instant.now()), details.getEventParameters(),
+                            subscription.getContractAddress(),
+                            log.get().getTransactionHash(),
+                            blockHeader.getNumber(), BlockStatus.PENDING.name(),
+                            log.get().getLogIndex(),
+                            blockHeader.getNetwork(), subscription.getWebhookId(),
+                            subscription.getContractId());
+
+                    try {
+                        BlockchainEvent event = blockchainEventRepository.save(blockchainEvent);
+
+                        EventJob job = new EventJob(event, new ContractEvent(
+                                subscription.getWebhookId(),
+                                subscription.getWebhookSecret(),
+                                subscription.getWebhookUrl(),
+                                subscription.getContractId()
+                        ), log.get().isRemoved() ? BlockStatus.REJECTED : BlockStatus.PENDING);
+                        eventJobs.add(job);
+                    } catch (Exception e) {
+                        if (e instanceof DataIntegrityViolationException && e.getCause() instanceof ConstraintViolationException) {
+                            logger.warn("Ignoring duplicate event");
+                            continue;
+                        }
+                        e.printStackTrace();
+                    }
+                }
+            }
+
+            saveBlockHeader(blockHeader);
+            return eventJobs;
+        } catch (Exception e) {
+            e.printStackTrace();
+        }
+        return null;
+    }
+
+    public void saveBlockHeader(WrappedBlockHeader header) {
+        try {
+            header.setCreatedAt(Date.from(Instant.now()));
+            wrappedBlockRepository.save(header);
+            logger.info("Saved block {}", header.getNumber());
+        } catch (Exception e) {
+            logger.error("Could not save block header", e);
+        }
+    }
+}

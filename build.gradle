@@ -1,0 +1,77 @@
+plugins {
+    id 'java-library'
+    id "com.github.node-gradle.node" version "3.5.1"
+	id "io.spring.dependency-management" version "1.0.0.RELEASE"
+    id "org.springframework.boot" version "2.7.8"
+    id 'com.github.johnrengelman.shadow' version '7.1.2'
+}
+
+repositories {
+    mavenCentral()
+}
+
+test {
+    useJUnitPlatform()
+    testLogging.showStandardStreams = true
+}
+
+java {
+    toolchain {
+        languageVersion = JavaLanguageVersion.of(11)
+    }
+}
+
+dependencies {
+    api (
+        'com.amazonaws:aws-lambda-java-core:1.2.1',
+        'com.amazonaws:aws-lambda-java-log4j:1.0.1',
+        'com.fasterxml.jackson.core:jackson-core:2.11.0',
+        'com.fasterxml.jackson.core:jackson-databind:2.11.0',
+        'com.fasterxml.jackson.core:jackson-annotations:2.11.0'
+    )
+    implementation 'org.web3j:core:4.9.7'
+    implementation 'org.springframework.boot:spring-boot-starter-web'
+    implementation 'org.springframework.boot:spring-boot-starter-data-jpa'
+    implementation group: 'com.amazonaws', name: 'amazon-sqs-java-messaging-lib', version: '2.0.3'
+    annotationProcessor 'org.springframework.boot:spring-boot-configuration-processor'
+    implementation 'org.postgresql:postgresql:42.2.24'
+    implementation 'com.google.code.gson:gson:2.10.1'
+    implementation 'com.vladmihalcea:hibernate-types-52:2.9.7'
+    implementation 'com.amazonaws:aws-lambda-java-events:3.10.0'
+
+    implementation 'software.amazon.awssdk:sesv2:2.20.26'
+    implementation("com.google.guava:guava:31.1-jre")
+
+
+    compileOnly 'org.projectlombok:lombok:1.18.24'
+    annotationProcessor 'org.projectlombok:lombok:1.18.24'
+    implementation 'org.flywaydb:flyway-core:9.14.1'
+    implementation 'org.springframework.cloud:spring-cloud-aws-messaging:2.2.6.RELEASE'
+
+    testImplementation('org.springframework.boot:spring-boot-starter-test')
+}
+
+// Task for building the zip file for upload
+
+task buildZip(type: Zip) {
+    // Using the Zip API from gradle to build a zip file of all the dependencies
+    //
+    // The path to this zip file can be set in the serverless.yml file for the
+    // package/artifact setting for deployment to the S3 bucket
+    //
+    // Link: https://docs.gradle.org/current/dsl/org.gradle.api.tasks.bundling.Zip.html
+
+    // set the base name of the zip file
+    from compileJava
+    from processResources
+    into('lib') {
+        from configurations.runtimeClasspath
+    }
+    archiveBaseName = "event-service-java"
+}
+
+task deploy(type: Exec, dependsOn: build) {
+    commandLine 'serverless', 'deploy', '--stage', 'local'
+}
+
+build.dependsOn buildZip

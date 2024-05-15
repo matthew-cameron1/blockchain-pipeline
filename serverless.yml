@@ -1,0 +1,119 @@
+org: mcameron1
+app: blockchain-event-service
+service: blockchain-event-service
+
+#should likely package individually!
+package:
+    artifact: build/distributions/event-service-java.zip
+plugins:
+  - serverless-localstack
+provider:
+  name: aws
+  runtime: java11
+  iam:
+    role: arn:aws:iam::478852791742:role/EventServiceLambda
+    deploymentRole: arn:aws:iam::478852791742:role/EventServiceLambda
+  logs:
+    restApi:
+      role: arn:aws:iam::478852791742:role/EventServiceLambda
+
+  environment:
+    DATABASE_URL: ${ssm:/Utiliti/EventService/${sls:stage}/DATABASE_URL, 'jdbc:postgresql://db/event-service?user=postgres&password=password'}
+    INTERNAL_API_KEY: ${ssm:/Utiliti/EventService/${sls:stage}/INTERNAL_API_KEY, '59ec8dd4-b41f-4e89-96a0-791358eb870e'}
+    INTERNAL_API_URL: ${ssm:/Utiliti/EventService/${sls:stage}/INTERNAL_API_URL, 'http://app:8000'}
+    SERVERLESS_ACCESS_KEY: AKtOg5foPg4SOVDz0adyxSoYsSDCsXEoomQ9Wf7AAC9Jm
+
+custom:
+  accountId:
+    local: 000000000000
+    production: ${aws:accountId}
+    dev: ${aws:accountId}
+  enterprise:
+    collectLambdaLogs: false
+  localstack:
+    stages:
+      - local
+    host: http://localstack
+
+  eventlog-queue-arn: arn:aws:sqs:${aws:region}:${self:custom.accountId.${sls:stage}}:${sls:stage}-eventlog
+
+functions:
+  event-log-function:
+    handler: ai.utiliti.bes.lambda.EventLogLambdaFunction
+    timeout: 60 # timeout in seconds
+    events:
+      - sqs: ${self:custom.eventlog-queue-arn}
+
+resources:
+  Resources:
+    # Event log queue that triggers the event log lambda function
+    EventLogQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-eventlog
+
+    # Block processing queues
+    PolygonBlockQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-polygon-blocks.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 30
+    EthereumBlockQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-ethereum-blocks.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 30
+    GoerliBlockQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-goerli-blocks.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 30
+    MumbaiBlockQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-mumbai-blocks.fifo
+        FifoQueue: true
+        ContentBasedDeduplication: true
+        VisibilityTimeout: 30
+
+    # Queues for handling metadata and transfer log data for ALL contracts
+    PolygonTransferHandlerQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-polygon-transfer-handler
+    EthereumTransferHandlerQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-ethereum-transfer-handler
+    GoerliTransferHandlerQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-goerli-transfer-handler
+    MumbaiTransferHandlerQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-mumbai-transfer-handler
+
+    # Queues for contract creation workers
+    PolygonContractCreationQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-polygon-contract-creation
+    EthereumContractCreationQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-ethereum-contract-creation
+    GoerliContractCreationQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-goerli-contract-creation
+    MumbaiContractCreationQueue:
+      Type: "AWS::SQS::Queue"
+      Properties:
+        QueueName: ${sls:stage}-mumbai-contract-creation
